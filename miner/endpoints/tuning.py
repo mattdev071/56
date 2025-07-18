@@ -1,0 +1,400 @@
+import os
+from datetime import datetime
+from datetime import timedelta
+from typing import List
+
+import toml
+import yaml
+from fastapi import Depends
+from fastapi import HTTPException
+from fastapi.routing import APIRouter
+from fiber.logging_utils import get_logger
+from fiber.miner.core.configuration import Config
+from fiber.miner.dependencies import blacklist_low_stake
+from fiber.miner.dependencies import get_config
+from fiber.miner.dependencies import verify_get_request
+from fiber.miner.dependencies import verify_request
+from pydantic import ValidationError
+
+import core.constants as cst
+from core.models.payload_models import MinerTaskOffer
+from core.models.payload_models import MinerTaskResponse
+from core.models.utility_models import MinerSubmission
+from validator.utils.hash_verification import calculate_model_hash
+from core.models.payload_models import TrainRequestGrpo
+from core.models.payload_models import TrainRequestImage
+from core.models.payload_models import TrainRequestText
+from core.models.payload_models import TrainResponse
+from core.models.utility_models import FileFormat
+from core.models.utility_models import TaskType
+from core.utils import download_s3_file
+from miner.config import WorkerConfig
+from miner.dependencies import get_worker_config
+from miner.logic.job_handler import create_job_diffusion
+from miner.logic.job_handler import create_job_text
+
+
+logger = get_logger(__name__)
+
+current_job_finish_time = None
+
+
+async def tune_model_text(
+    train_request: TrainRequestText,
+    worker_config: WorkerConfig = Depends(get_worker_config),
+):
+    global current_job_finish_time
+    logger.info("Starting model tuning.")
+
+    current_job_finish_time = datetime.now() + timedelta(hours=train_request.hours_to_complete)
+    logger.info(f"Job received is {train_request}")
+
+    try:
+        logger.info(train_request.file_format)
+        if train_request.file_format != FileFormat.HF:
+            if train_request.file_format == FileFormat.S3:
+                train_request.dataset = await download_s3_file(train_request.dataset)
+                logger.info(train_request.dataset)
+                train_request.file_format = FileFormat.JSON
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    job = create_job_text(
+        job_id=str(train_request.task_id),
+        dataset=train_request.dataset,
+        model=train_request.model,
+        dataset_type=train_request.dataset_type,
+        file_format=train_request.file_format,
+        expected_repo_name=train_request.expected_repo_name,
+    )
+    logger.info(f"Created job {job}")
+    worker_config.trainer.enqueue_job(job)
+
+    return {"message": "Training job enqueued.", "task_id": job.job_id}
+
+
+async def tune_model_grpo(
+    train_request: TrainRequestGrpo,
+    worker_config: WorkerConfig = Depends(get_worker_config),
+):
+    global current_job_finish_time
+    logger.info("Starting model tuning.")
+
+    current_job_finish_time = datetime.now() + timedelta(hours=train_request.hours_to_complete)
+    logger.info(f"Job received is {train_request}")
+
+    try:
+        logger.info(train_request.file_format)
+        if train_request.file_format != FileFormat.HF:
+            if train_request.file_format == FileFormat.S3:
+                train_request.dataset = await download_s3_file(train_request.dataset)
+                logger.info(train_request.dataset)
+                train_request.file_format = FileFormat.JSON
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    job = create_job_text(
+        job_id=str(train_request.task_id),
+        dataset=train_request.dataset,
+        model=train_request.model,
+        dataset_type=train_request.dataset_type,
+        file_format=train_request.file_format,
+        expected_repo_name=train_request.expected_repo_name,
+    )
+    logger.info(f"Created job {job}")
+    worker_config.trainer.enqueue_job(job)
+
+    return {"message": "Training job enqueued.", "task_id": job.job_id}
+
+
+async def tune_model_diffusion(
+    train_request: TrainRequestImage,
+    worker_config: WorkerConfig = Depends(get_worker_config),
+):
+    global current_job_finish_time
+    logger.info("Starting model tuning.")
+
+    current_job_finish_time = datetime.now() + timedelta(hours=train_request.hours_to_complete)
+    logger.info(f"Job received is {train_request}")
+    try:
+        train_request.dataset_zip = await download_s3_file(
+            train_request.dataset_zip, f"{cst.DIFFUSION_DATASET_DIR}/{train_request.task_id}.zip"
+        )
+        logger.info(train_request.dataset_zip)
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    job = create_job_diffusion(
+        job_id=str(train_request.task_id),
+        dataset_zip=train_request.dataset_zip,
+        model=train_request.model,
+        model_type=train_request.model_type,
+        expected_repo_name=train_request.expected_repo_name,
+    )
+    logger.info(f"Created job {job}")
+    worker_config.trainer.enqueue_job(job)
+
+    return {"message": "Training job enqueued.", "task_id": job.job_id}
+
+
+async def get_latest_model_submission(task_id: str) -> MinerSubmission:
+    try:
+        config_filename = f"{task_id}.yml"
+        config_path = os.path.join(cst.CONFIG_DIR, config_filename)
+        repo_id = None
+        
+        if os.path.exists(config_path):
+            with open(config_path, "r") as file:
+                config_data = yaml.safe_load(file)
+                repo_id = config_data.get("hub_model_id", None)
+        else:
+            config_filename = f"{task_id}.toml"
+            config_path = os.path.join(cst.CONFIG_DIR, config_filename)
+            with open(config_path, "r") as file:
+                config_data = toml.load(file)
+                repo_id = config_data.get("huggingface_repo_id", None)
+
+        if repo_id is None:
+            raise HTTPException(status_code=404, detail=f"No model submission found for task {task_id}")
+
+        model_hash = calculate_model_hash(repo_id)
+        
+        return MinerSubmission(repo=repo_id, model_hash=model_hash)
+
+    except FileNotFoundError as e:
+        logger.error(f"No submission found for task {task_id}: {str(e)}")
+        raise HTTPException(status_code=404, detail=f"No model submission found for task {task_id}")
+    except Exception as e:
+        logger.error(f"Error retrieving latest model submission for task {task_id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving latest model submission: {str(e)}",
+        )
+
+
+async def task_offer(
+    request: MinerTaskOffer,
+    config: Config = Depends(get_config),
+    worker_config: WorkerConfig = Depends(get_worker_config),
+) -> MinerTaskResponse:
+    try:
+        logger.info("An offer has come through")
+        # Advanced job acceptance strategy for ranking #1
+        global current_job_finish_time
+        current_time = datetime.now()
+        
+        # Accept all text task types for maximum throughput
+        if request.task_type not in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK]:
+            return MinerTaskResponse(
+                message=f"This endpoint only accepts text tasks: "
+                f"{TaskType.INSTRUCTTEXTTASK}, {TaskType.DPOTASK}, {TaskType.GRPOTASK} and {TaskType.CHATTASK}",
+                accepted=False,
+            )
+
+        # Accept all model types (not just llama) for broader coverage
+        model_name = request.model.lower()
+        
+        # Strategic job acceptance based on model size and task type
+        model_size = _estimate_model_size_from_name(request.model)
+        
+        # Calculate optimal acceptance strategy
+        max_hours = _calculate_max_hours_for_model(model_size, request.task_type)
+        
+        # Check if we have capacity (H100 setup can handle multiple jobs)
+        if current_job_finish_time is None or current_time + timedelta(hours=0.5) > current_job_finish_time:
+            if request.hours_to_complete <= max_hours:
+                logger.info(f"Accepting {request.task_type} job for {request.model} (estimated {model_size}B params)")
+                return MinerTaskResponse(
+                    message=f"Yes. I can do {request.task_type} jobs with H100 parallel processing", 
+                    accepted=True
+                )
+            else:
+                logger.info(f"Rejecting offer - too long ({request.hours_to_complete}h > {max_hours}h)")
+                return MinerTaskResponse(
+                    message=f"Job too long for my current capacity. Max: {max_hours}h", 
+                    accepted=False
+                )
+        else:
+            return MinerTaskResponse(
+                message=f"Currently busy with another job until {current_job_finish_time.isoformat()}",
+                accepted=False,
+            )
+
+    except ValidationError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error in task_offer: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing task offer: {str(e)}")
+
+
+def _estimate_model_size_from_name(model_name: str) -> int:
+    """Estimate model size from model name"""
+    model_name_lower = model_name.lower()
+    if "70b" in model_name_lower:
+        return 70
+    elif "34b" in model_name_lower or "33b" in model_name_lower:
+        return 34
+    elif "13b" in model_name_lower:
+        return 13
+    elif "7b" in model_name_lower:
+        return 7
+    elif "3b" in model_name_lower:
+        return 3
+    return 7  # Default assumption
+
+
+def _calculate_max_hours_for_model(model_size: int, task_type: TaskType) -> int:
+    """Calculate maximum acceptable hours based on model size and task type"""
+    
+    # Base hours by model size
+    if model_size >= 70:
+        base_hours = 8
+    elif model_size >= 34:
+        base_hours = 6
+    elif model_size >= 13:
+        base_hours = 4
+    elif model_size >= 7:
+        base_hours = 3
+    else:
+        base_hours = 2
+    
+    # Adjust based on task type
+    if task_type == TaskType.DPOTASK:
+        # DPO tasks are more complex, allow more time
+        return base_hours + 2
+    elif task_type == TaskType.GRPOTASK:
+        # GRPO tasks are also complex
+        return base_hours + 2
+    elif task_type == TaskType.CHATTASK:
+        # Chat tasks are simpler
+        return base_hours - 1
+    else:
+        # Standard instruction tuning
+        return base_hours
+
+
+async def task_offer_image(
+    request: MinerTaskOffer,
+    config: Config = Depends(get_config),
+    worker_config: WorkerConfig = Depends(get_worker_config),
+) -> MinerTaskResponse:
+    try:
+        logger.info("An image offer has come through")
+        global current_job_finish_time
+        current_time = datetime.now()
+
+        if request.task_type != TaskType.IMAGETASK:
+            return MinerTaskResponse(message="This endpoint only accepts image tasks", accepted=False)
+
+        # Enhanced image job acceptance strategy
+        model_name = request.model.lower()
+        
+        # Calculate optimal hours for image tasks
+        max_hours = _calculate_max_hours_for_image_model(model_name)
+        
+        if current_job_finish_time is None or current_time + timedelta(hours=0.5) > current_job_finish_time:
+            if request.hours_to_complete <= max_hours:
+                logger.info(f"Accepting image job for {request.model} (max {max_hours}h)")
+                return MinerTaskResponse(
+                    message=f"Yes. I can do image jobs with H100 parallel processing", 
+                    accepted=True
+                )
+            else:
+                logger.info(f"Rejecting image offer - too long ({request.hours_to_complete}h > {max_hours}h)")
+                return MinerTaskResponse(
+                    message=f"Image job too long for my current capacity. Max: {max_hours}h", 
+                    accepted=False
+                )
+        else:
+            return MinerTaskResponse(
+                message=f"Currently busy with another job until {current_job_finish_time.isoformat()}",
+                accepted=False,
+            )
+
+    except ValidationError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error in task_offer_image: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing task offer: {str(e)}")
+
+
+def _calculate_max_hours_for_image_model(model_name: str) -> int:
+    """Calculate maximum acceptable hours for image models"""
+    
+    if "sdxl" in model_name.lower():
+        # SDXL models are larger and more complex
+        return 4
+    elif "flux" in model_name.lower():
+        # Flux models are also complex
+        return 4
+    elif "stable-diffusion" in model_name.lower():
+        # Standard SD models
+        return 3
+    else:
+        # Default for unknown models
+        return 3
+
+
+def factory_router() -> APIRouter:
+    router = APIRouter()
+    router.add_api_route(
+        "/task_offer/",
+        task_offer,
+        tags=["Subnet"],
+        methods=["POST"],
+        response_model=MinerTaskResponse,
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+    )
+
+    router.add_api_route(
+        "/task_offer_image/",
+        task_offer_image,
+        tags=["Subnet"],
+        methods=["POST"],
+        response_model=MinerTaskResponse,
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+    )
+
+    router.add_api_route(
+        "/get_latest_model_submission/{task_id}",
+        get_latest_model_submission,
+        tags=["Subnet"],
+        methods=["GET"],
+        response_model=MinerSubmission,
+        summary="Get Latest Model Submission",
+        description="Retrieve the latest model submission for a given task ID",
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_get_request)],
+    )
+    router.add_api_route(
+        "/start_training/",  # TODO: change to /start_training_text or similar
+        tune_model_text,
+        tags=["Subnet"],
+        methods=["POST"],
+        response_model=TrainResponse,
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+    )
+    router.add_api_route(
+        "/start_training_grpo/",
+        tune_model_grpo,
+        tags=["Subnet"],
+        methods=["POST"],
+        response_model=TrainResponse,
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+    )
+    router.add_api_route(
+        "/start_training_image/",
+        tune_model_diffusion,
+        tags=["Subnet"],
+        methods=["POST"],
+        response_model=TrainResponse,
+        dependencies=[Depends(blacklist_low_stake), Depends(verify_request)],
+    )
+
+    return router
